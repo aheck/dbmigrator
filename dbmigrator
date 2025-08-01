@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import re
+import mysql.connector
+
+class Migration:
+    def __init__(self):
+        self.schema_version = None
+        self.filename = None
+
+def get_env_variable(name):
+    if name not in os.environ:
+        raise ValueError("ERROR: Environment variable '%s' is not set" % (name), sys.stderr)
+
+    return os.environ[name]
+
+def get_schema_version(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT schema_version FROM tbl_schema_version")
+
+    return cur.fetchone()[0]
+
+def schema_table_exists(conn):
+    cur = conn.cursor()
+    cur.execute("SELECT EXISTS(SELECT * FROM information_schema.tables WHERE table_name=%s)",
+            ('tbl_schema_version',))
+
+    return cur.fetchone()[0]
+
+def create_schema_table(conn):
+    print("Trying to create tbl_schema_version...")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE tbl_schema_version (schema_version INT);")
+    cur.execute("INSERT INTO tbl_schema_version (schema_version) VALUES (0)")
+    conn.commit()
+    print("Created tbl_schema_version")
+
+def get_missing_migrations(db_schema_version, migrations_dir):
+    migrations = []
+
+    for filename in os.listdir(migrations_dir):
+        m = re.match(r"^(\d+)\.sql$", filename)
+        if not m:
+            continue
+
+        migration_version = int(m[1])
+        if migration_version <= db_schema_version:
+            continue
+
+        mig = Migration()
+        mig.schema_version = migration_version
+        mig.filename = os.path.join(migrations_dir, filename)
+        migrations.append(mig)
+
+    return sorted(migrations, key=lambda mig: mig.schema_version)
+
+def exec_migration_script(conn, migration):
+    print("Trying to upgrade to schema version:", migration.schema_version)
+    sql = ''
+    with open(migration.filename, 'r') as f:
+        sql = f.read()
+
+    cur = conn.cursor()
+    for stmt in sql.split(';'):
+        if len(stmt.strip()) > 0:
+            cur.execute(stmt + ';')
+    cur.execute("UPDATE tbl_schema_version SET schema_version=%s",
+            (migration.schema_version,))
+    conn.commit()
+    print("New schema version:", migration.schema_version)
+
+hostname = get_env_variable('DB_HOST')
+port     = get_env_variable('DB_PORT')
+username = get_env_variable('DB_USER')
+password = get_env_variable('DB_PASS')
+database = get_env_variable('DB_NAME')
+
+migrations_dir = get_env_variable('DB_MIGRATIONS_DIR')
+
+if hostname == 'localhost':
+    conn = mysql.connector.connect(host=hostname, port=port, user=username,
+            password=password, database=database)
+else:
+    conn = mysql.connector.connect(host=hostname, port=port, user=username,
+            password=password, database=database,
+            ssl_ca='/no-ca.pem', ssl_cert='/no-client-cert.pem',
+            ssl_key='/no-client-key.pem')
+
+conn.autoconnect = False
+
+if not schema_table_exists(conn):
+    create_schema_table(conn)
+
+version = get_schema_version(conn)
+print("Current schema version:", version)
+
+migrations = get_missing_migrations(version, migrations_dir)
+if len(migrations) == 0:
+    print("No migrations found")
+else:
+    for mig in migrations:
+        exec_migration_script(conn, mig)
+
+conn.close()
